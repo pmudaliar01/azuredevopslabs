@@ -1,0 +1,103 @@
+trigger:
+  branches: { include: [ main ] }
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  rg: 'rg-devops-vm-lab'
+  acrName: '$(ACR_NAME)'                 # set in Pipeline Variables
+  vmName: 'vm-devops-lab'
+  vmAdmin: 'azureuser'
+  appName: 'py-flask'
+  port: '8000'
+  imageTag: '$(Build.BuildId)'
+  azureServiceConnection: '<YOUR_SERVICE_CONNECTION>'
+
+stages:
+- stage: BuildAndPush
+  jobs:
+  - job: build
+    steps:
+    - checkout: self
+      clean: true
+
+    - task: UsePythonVersion@0
+      inputs: { versionSpec: '3.11' }
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest flake8
+        flake8 .
+        pytest -q
+      displayName: Lint & Test
+
+    - task: AzureCLI@2
+      displayName: 'ACR build & push'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          ACR_LOGIN_SERVER=$(az acr show -n "$(acrName)" -g "$(rg)" --query loginServer -o tsv)
+          echo "##vso[task.setvariable variable=ACR_LOGIN_SERVER;isOutput=true]$ACR_LOGIN_SERVER"
+          IMAGE="$ACR_LOGIN_SERVER/$(appName):$(imageTag)"
+          az acr build -r "$(acrName)" -g "$(rg)" -t "$IMAGE" .
+
+- stage: DeployVM
+  dependsOn: BuildAndPush
+  jobs:
+  - job: deploy
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Provision Docker (first run) & start container'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          ACR_LOGIN_SERVER=$(az acr show -n "$(acrName)" -g "$(rg)" --query loginServer -o tsv)
+          ACR_USER=$(az acr credential show -n "$(acrName)" -g "$(rg)" --query username -o tsv)
+          ACR_PASS=$(az acr credential show -n "$(acrName)" -g "$(rg)" --query passwords[0].value -o tsv)
+          IMAGE="$ACR_LOGIN_SERVER/$(appName):$(imageTag)"
+
+          # Push cloud-init to VM on first deployment (idempotent)
+          az vm run-command invoke -g "$(rg)" -n "$(vmName)" \
+            --command-id RunShellScript \
+            --scripts "bash -s" \
+            --parameters <<'EOF'
+          set -e
+          if ! command -v docker >/dev/null 2>&1; then
+            apt-get update -y
+            apt-get install -y docker.io ca-certificates curl
+            systemctl enable docker
+            systemctl start docker
+            usermod -aG docker azureuser || true
+          fi
+          EOF
+
+          # Login to ACR, stop old container, run new
+          az vm run-command invoke -g "$(rg)" -n "$(vmName)" \
+            --command-id RunShellScript \
+            --scripts "bash -s" \
+            --parameters <<EOF
+          set -e
+          ACR="$ACR_LOGIN_SERVER"
+          USER="$ACR_USER"
+          PASS="$ACR_PASS"
+          APP="$(appName)"
+          PORT="$(port)"
+          IMAGE="$IMAGE"
+
+          echo "\$PASS" | docker login "\$ACR" -u "\$USER" --password-stdin
+          docker rm -f "\$APP" 2>/dev/null || true
+          docker pull "\$IMAGE"
+          docker run -d --restart=always --name "\$APP" -p \$PORT:8000 "\$IMAGE"
+          EOF
+
+          VM_IP=$(az vm list-ip-addresses -g "$(rg)" -n "$(vmName)" --query "[0].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv)
+          echo "App URL: http://$VM_IP:$(port)"
+
